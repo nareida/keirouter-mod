@@ -1,0 +1,1506 @@
+package connectors
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/mydisha/keirouter/backend/internal/core"
+	"github.com/mydisha/keirouter/backend/internal/transform"
+)
+
+// Kiro drives AWS CodeWhisperer's generateAssistantResponse endpoint used by
+// Kiro AI. The request is a conversationState payload (built by the Kiro codec);
+// the response is a binary AWS EventStream of typed events
+// (assistantResponseEvent, reasoningContentEvent, toolUseEvent, messageStopEvent,
+// metricsEvent, ...). This connector parses the binary frames and maps them to
+// canonical chunks.
+type Kiro struct {
+	id          string
+	defaultBase string
+	codec       transform.KiroCodec
+}
+
+const (
+	kiroModelCacheTTL = 5 * time.Minute
+	kiroQuotaCacheTTL = 30 * time.Second
+
+	kiroShortFinalMaxChars = 800
+
+	kiroIntegrityBufferMaxBytes = 8 * 1024 * 1024
+	eventStreamMaxMessageBytes  = 24 * 1024 * 1024
+	eventStreamMaxHeadersBytes  = 128 * 1024
+)
+
+var (
+	kiroRepairInstructions = map[string]string{
+		"tool":        "Retry the previous response because its tool_call wrapper was malformed. The tool name and arguments fields must both be present and non-empty.",
+		"ellipsis":    "Retry the previous response because it ended with only an ellipsis. Return the complete final answer.",
+		"short_final": "Retry the previous response because it only announced a future action without completing it. Complete the work now and return the result.",
+	}
+
+	reShortFutureActionEN = regexp.MustCompile(`(?i)^(?:(?:next|now|then)\b[\s,:-]*)?(?:i(?:'ll| will| am going to| need to)|let me)\s+(?:verify|check|confirm|validate|investigate|trace|continue|follow up|test)\b`)
+	reShortFutureActionZH = regexp.MustCompile(`^(?:(?:現在|接著|接下來|下一步)[，,:：\s]*(?:我(?:只)?(?:會|要|將|再)?\s*)?|我只再|我(?:會|要|將)(?:再|重新)?)(?:補|抓取|查|確認|驗證|追|繼續|檢查|測試)`)
+	reResultClauseEN      = regexp.MustCompile(`(?i)[:;\n]|[.!?]\s+\S|\b(?:status|checksum|response|deployment)\s+(?:is|are|was|were|matches?|equals?|returned)\b`)
+	reResultClauseZH      = regexp.MustCompile(`[。！？]\s*\S|(?:版本|狀態|回應|結果|部署|校驗碼)(?:是|為|等於|顯示)`)
+	reCompletedFinal      = regexp.MustCompile(`(?i)已(?:經)?完成|完成(?:了|驗證|確認)|修復完成|確認無誤|驗證(?:完成|通過)|測試(?:均)?通過|結論|總結|\b(?:done|completed|fixed|verified|confirmed|passed|in conclusion|summary)\b|\b(?:is|are) complete\b`)
+	reResultEvidence      = regexp.MustCompile(`(?i)顯示|發現|因此|成功|失敗|正常|無錯誤|沒有錯誤|\b(?:found|shows?|showed|because|therefore|succeeded|failed|healthy|green|no errors?)\b`)
+	reUserWait            = regexp.MustCompile(`(?i)請(?:你|先)|你(?:先|需要|可以|提供|確認|批准|允許)|等待(?:你|使用者)|等你|核准|同意|授權|\b(?:after|when|once)\s+you\b|\byour\s+(?:approval|confirmation|permission|input)\b|\bwait(?:ing)?\s+for\s+you\b|\bplease\s+(?:approve|confirm|provide|send)\b`)
+)
+
+type kiroModelCacheEntry struct {
+	expiresAt time.Time
+	models    []ModelSpec
+}
+
+type kiroQuotaCacheEntry struct {
+	expiresAt time.Time
+	quota     *QuotaResult
+}
+
+var (
+	kiroAccountSlots sync.Map
+	kiroModelCache   sync.Map
+	kiroQuotaCache   sync.Map
+)
+
+// NewKiro builds a Kiro connector.
+func NewKiro(id, defaultBaseURL string) *Kiro {
+	return &Kiro{id: id, defaultBase: defaultBaseURL}
+}
+
+func (c *Kiro) ID() string            { return c.id }
+func (c *Kiro) Dialect() core.Dialect { return core.DialectKiro }
+
+// kiroEndpoints are the interchangeable regional surfaces of the Kiro
+// generateAssistantResponse service. They are attempted in order only for edge
+// and transport failures. The hosts share account-level limits, so a 429 must
+// never be retried against another host.
+var kiroEndpoints = []string{
+	"https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+	"https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+	"https://q.us-east-1.amazonaws.com/generateAssistantResponse",
+}
+
+// isKiroAPIKey reports whether the credentials authenticate with a long-lived
+// CodeWhisperer API key rather than an OAuth/social access token.
+func isKiroAPIKey(creds core.Credentials) bool {
+	return creds.Extra["kiro_auth_method"] == "api_key"
+}
+
+func isKiroExternalIDP(creds core.Credentials) bool {
+	return creds.Extra["kiro_auth_method"] == "external_idp"
+}
+
+func usesKiroCodeWhispererSurface(creds core.Credentials) bool {
+	switch creds.Extra["kiro_auth_method"] {
+	case "api_key", "external_idp", "idc":
+		return true
+	default:
+		return false
+	}
+}
+
+// Public default CodeWhisperer profile ARNs (us-east-1), keyed by auth method.
+// Used when an OAuth/social connection could not resolve its own profileArn.
+// Builder ID and social (Google/GitHub/imported) sign-ins map to different
+// shared profiles. Kiro upstream now rejects a generateAssistantResponse
+// request without a profileArn (400 "profileArn is required for this request."),
+// so an OAuth/social connection must always carry one.
+const (
+	kiroDefaultProfileArnBuilderID = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+	kiroDefaultProfileArnSocial    = "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+)
+
+// kiroDefaultProfileArn resolves the shared default profileArn for a given OAuth
+// auth method. Social sign-ins (Google/GitHub/imported Kiro IDE tokens) map to
+// the social profile; Builder ID maps to the builder-id profile.
+func kiroDefaultProfileArn(authMethod string) string {
+	switch authMethod {
+	case "google", "github", "imported", "social":
+		return kiroDefaultProfileArnSocial
+	default:
+		return kiroDefaultProfileArnBuilderID
+	}
+}
+
+// kiroResolveProfileArn returns the profileArn to attach to a chat request. For
+// account-bound auth, only an ARN actually resolved for the credential is used.
+// For OAuth/social auth the connection's resolved ARN is preferred, falling
+// back to the shared default keyed by auth method.
+func kiroResolveProfileArn(creds core.Credentials) string {
+	resolved := creds.Extra["kiro_profile_arn"]
+	if resolved == "" {
+		resolved = creds.Extra["profile_arn"]
+	}
+	if usesKiroCodeWhispererSurface(creds) {
+		return resolved
+	}
+	if resolved != "" {
+		return resolved
+	}
+	return kiroDefaultProfileArn(creds.Extra["kiro_auth_method"])
+}
+
+// kiroAPIKey resolves the raw API key from the credentials. The key may arrive
+// in the dedicated APIKey field or, for imported connections, as the access
+// token.
+func kiroAPIKey(creds core.Credentials) string {
+	if creds.APIKey != "" {
+		return creds.APIKey
+	}
+	return creds.AccessToken
+}
+
+// endpoints returns the ordered list of upstream hosts to try for this request.
+// The configured base (a per-credential BaseURL when set, otherwise the
+// connector default) leads. The remaining known regional surfaces are appended
+// as failover hosts only when the primary is itself a known Kiro production
+// surface; a custom base URL (a relay, proxy, or test server) is used verbatim
+// so operator overrides are never bypassed. Account-bound credentials use the
+// regional CodeWhisperer surface, so amazonaws.com hosts are pulled to the front.
+func (c *Kiro) endpoints(creds core.Credentials) []string {
+	primary := creds.BaseURL
+	if primary == "" {
+		primary = c.defaultBase
+	}
+	// A custom (non-production) base is used as-is, with no fallback injection.
+	if primary != "" && !isKnownKiroEndpoint(primary) {
+		return []string{primary}
+	}
+	list := make([]string, 0, len(kiroEndpoints)+1)
+	if primary != "" {
+		list = append(list, primary)
+	}
+	for _, e := range kiroEndpoints {
+		if e != primary {
+			list = append(list, e)
+		}
+	}
+	if usesKiroCodeWhispererSurface(creds) {
+		region := strings.TrimSpace(creds.Extra["kiro_region"])
+		if region == "" {
+			region = "us-east-1"
+		}
+		for i, endpoint := range list {
+			list[i] = regionalizeKiroEndpoint(endpoint, region)
+		}
+		list = orderAmazonFirst(list)
+	}
+	return list
+}
+
+func regionalizeKiroEndpoint(endpoint, region string) string {
+	if region == "" || region == "us-east-1" || !strings.Contains(endpoint, "amazonaws.com") {
+		return endpoint
+	}
+	return strings.Replace(endpoint, ".us-east-1.amazonaws.com", "."+region+".amazonaws.com", 1)
+}
+
+// isKnownKiroEndpoint reports whether url is one of the built-in Kiro regional
+// surfaces. Only these participate in cross-host failover.
+func isKnownKiroEndpoint(url string) bool {
+	for _, e := range kiroEndpoints {
+		if e == url {
+			return true
+		}
+	}
+	return false
+}
+
+// orderAmazonFirst reorders endpoints so the amazonaws.com hosts come before
+// any others, preserving relative order within each group.
+func orderAmazonFirst(endpoints []string) []string {
+	amazon := make([]string, 0, len(endpoints))
+	others := make([]string, 0, len(endpoints))
+	for _, e := range endpoints {
+		if strings.Contains(e, "amazonaws.com") {
+			amazon = append(amazon, e)
+		} else {
+			others = append(others, e)
+		}
+	}
+	if len(amazon) == 0 {
+		return endpoints
+	}
+	return append(amazon, others...)
+}
+
+// kiroEndpointRetryable reports whether an endpoint failure is worth retrying on
+// an alternate Kiro host. Only upstream 5xx and transport/timeout errors qualify;
+// account-level rate limits, auth, bad-request, and quota errors are returned to
+// the caller immediately since another host would reject them the same way.
+func kiroEndpointRetryable(err error) bool {
+	pe := core.AsProviderError(err)
+	if pe == nil {
+		return false
+	}
+	switch pe.Kind {
+	case core.ErrUpstream, core.ErrTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+// openStreamWithFailover opens the binary eventstream POST against each
+// candidate endpoint in order. A retryable edge failure (5xx or transport)
+// advances to the next host; account-level and request-level rejections are
+// returned at once. The last error is returned when every host is exhausted.
+func (c *Kiro) openStreamWithFailover(ctx context.Context, model string, body []byte, headers map[string]string, endpoints []string) (*http.Response, error) {
+	var lastErr error
+	for i, url := range endpoints {
+		resp, err := openStream(ctx, c.id, model, url, body, headers)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		// Stop early on a definitive rejection, or when no hosts remain.
+		if !kiroEndpointRetryable(err) || i == len(endpoints)-1 {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// acquireAccountSlot limits an account to one in-flight upstream operation. This
+// closes the race where generations and metadata probes are dispatched before
+// the first 429 has had a chance to put the account into cooldown.
+func (c *Kiro) acquireAccountSlot(ctx context.Context, creds core.Credentials, model string) (func(), error) {
+	if creds.AccountID == "" {
+		return func() {}, nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	value, _ := kiroAccountSlots.LoadOrStore(creds.AccountID, make(chan struct{}, 1))
+	slot := value.(chan struct{})
+	select {
+	case slot <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-slot }) }, nil
+	default:
+		return nil, &core.ProviderError{
+			Kind:       core.ErrRateLimit,
+			Provider:   c.id,
+			Model:      model,
+			StatusCode: http.StatusTooManyRequests,
+			RetryAfter: 2 * time.Second,
+			Message:    "another request is already in flight for this account",
+		}
+	}
+}
+
+// headers builds the AWS SDK + CodeWhisperer headers Kiro expects.
+func (c *Kiro) headers(creds core.Credentials) map[string]string {
+	h := map[string]string{
+
+		"Accept":                "application/vnd.amazon.eventstream",
+		"X-Amz-Target":          "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+		"User-Agent":            "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+		"X-Amz-User-Agent":      "aws-sdk-js/3.0.0 kiro-ide/1.0.0",
+		"Amz-Sdk-Request":       "attempt=1; max=3",
+		"Amz-Sdk-Invocation-Id": uuid.NewString(),
+	}
+	if isKiroAPIKey(creds) {
+		// API-key credentials are sent as a long-lived bearer token with an
+		// explicit marker so CodeWhisperer treats them as a headless API key
+		// rather than a short-lived OIDC/social access token.
+		if key := kiroAPIKey(creds); key != "" {
+			h["Authorization"] = bearer(key)
+			h["tokentype"] = "API_KEY"
+		}
+	} else if creds.AccessToken != "" {
+		h["Authorization"] = bearer(creds.AccessToken)
+		if isKiroExternalIDP(creds) {
+			h["TokenType"] = "EXTERNAL_IDP"
+		}
+	}
+	return mergeHeaders(h, creds.Headers)
+}
+
+// Validate probes the Kiro upstream by calling ListAvailableModels. If the
+// access token is missing or rejected, an error is returned.
+func (c *Kiro) Validate(ctx context.Context, creds core.Credentials) error {
+	token := kiroAPIKey(creds)
+	if token == "" {
+		return fmt.Errorf("validation failed for %s: no access token", c.id)
+	}
+	releaseAccount, err := c.acquireAccountSlot(ctx, creds, "validate")
+	if err != nil {
+		return fmt.Errorf("validation failed for %s: %w", c.id, err)
+	}
+	defer releaseAccount()
+	// Use ListAvailableModels to verify the token. Region defaults to us-east-1.
+	region := creds.Extra["kiro_region"]
+	if region == "" {
+		region = "us-east-1"
+	}
+	url := fmt.Sprintf("https://q.%s.amazonaws.com/ListAvailableModels?origin=AI_EDITOR", region)
+	h := map[string]string{
+		"Authorization": bearer(token),
+		"Accept":        "application/json",
+		"User-Agent":    "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+	}
+	if isKiroAPIKey(creds) {
+		h["tokentype"] = "API_KEY"
+	} else if isKiroExternalIDP(creds) {
+		h["TokenType"] = "EXTERNAL_IDP"
+	}
+	_, err = doJSONMethod(ctx, http.MethodGet, c.id, "validate", url, nil, h)
+	if err != nil {
+		return fmt.Errorf("validation failed for %s: %w", c.id, err)
+	}
+	return nil
+}
+
+// ---- Live model discovery ---------------------------------------------------
+
+// kiroModelEntry is the shape of one model in the ListAvailableModels response.
+type kiroModelEntry struct {
+	ModelID        string  `json:"modelId"`
+	ModelName      string  `json:"modelName"`
+	Description    string  `json:"description"`
+	RateMultiplier float64 `json:"rateMultiplier"`
+	TokenLimits    struct {
+		MaxInputTokens int `json:"maxInputTokens"`
+	} `json:"tokenLimits"`
+}
+
+// ListModels fetches the live Kiro model catalog and expands each upstream
+// model into synthetic variants (-thinking, -agentic, -thinking-agentic).
+// Implements LiveModelSource.
+func (c *Kiro) ListModels(ctx context.Context, creds core.Credentials) ([]ModelSpec, error) {
+	token := kiroAPIKey(creds)
+	if token == "" {
+		return nil, fmt.Errorf("kiro: ListModels: no access token")
+	}
+	if cached, ok := loadKiroModels(creds.AccountID); ok {
+		return cached, nil
+	}
+	releaseAccount, err := c.acquireAccountSlot(ctx, creds, "list-models")
+	if err != nil {
+		return nil, fmt.Errorf("kiro: ListModels: %w", err)
+	}
+	defer releaseAccount()
+	if cached, ok := loadKiroModels(creds.AccountID); ok {
+		return cached, nil
+	}
+	region := creds.Extra["kiro_region"]
+	if region == "" {
+		region = "us-east-1"
+	}
+	profileArn := kiroResolveProfileArn(creds)
+
+	params := "origin=AI_EDITOR"
+	if profileArn != "" {
+		params += "&profileArn=" + profileArn
+	}
+	url := fmt.Sprintf("https://q.%s.amazonaws.com/ListAvailableModels?%s", region, params)
+
+	h := map[string]string{
+		"Authorization": bearer(token),
+		"Accept":        "application/json",
+		"User-Agent":    "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+	}
+	if isKiroAPIKey(creds) {
+		h["tokentype"] = "API_KEY"
+	} else if isKiroExternalIDP(creds) {
+		h["TokenType"] = "EXTERNAL_IDP"
+	}
+	body, err := doJSONMethod(ctx, http.MethodGet, c.id, "list-models", url, nil, h)
+	if err != nil {
+		return nil, fmt.Errorf("kiro: ListModels: %w", err)
+	}
+
+	var resp struct {
+		Models []kiroModelEntry `json:"models"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("kiro: ListModels: parse: %w", err)
+	}
+
+	var out []ModelSpec
+	for _, m := range resp.Models {
+		upstream := m.ModelID
+		if upstream == "" {
+			continue
+		}
+		display := m.ModelName
+		if display == "" {
+			display = upstream
+		}
+		// Format display name with rate multiplier if non-default.
+		if m.RateMultiplier > 0 && m.RateMultiplier != 1.0 {
+			display = fmt.Sprintf("Kiro %s (%.1fx credit)", display, m.RateMultiplier)
+		} else {
+			display = "Kiro " + display
+		}
+
+		isAuto := upstream == "auto"
+
+		// Base model.
+		out = append(out, ModelSpec{ID: upstream, Name: display, Kind: core.ServiceLLM})
+		// Thinking variant.
+		out = append(out, ModelSpec{ID: upstream + "-thinking", Name: display + " (Thinking)", Kind: core.ServiceLLM})
+		// Agentic variant (skip for auto — Kiro picks model server-side).
+		if !isAuto {
+			out = append(out, ModelSpec{ID: upstream + "-agentic", Name: display + " (Agentic)", Kind: core.ServiceLLM})
+			out = append(out, ModelSpec{ID: upstream + "-thinking-agentic", Name: display + " (Thinking + Agentic)", Kind: core.ServiceLLM})
+		}
+	}
+	storeKiroModels(creds.AccountID, out)
+	return out, nil
+}
+
+func loadKiroModels(accountID string) ([]ModelSpec, bool) {
+	if accountID == "" {
+		return nil, false
+	}
+	value, ok := kiroModelCache.Load(accountID)
+	if !ok {
+		return nil, false
+	}
+	entry := value.(kiroModelCacheEntry)
+	if time.Now().After(entry.expiresAt) {
+		kiroModelCache.Delete(accountID)
+		return nil, false
+	}
+	return append([]ModelSpec(nil), entry.models...), true
+}
+
+func storeKiroModels(accountID string, models []ModelSpec) {
+	if accountID == "" {
+		return
+	}
+	kiroModelCache.Store(accountID, kiroModelCacheEntry{
+		expiresAt: time.Now().Add(kiroModelCacheTTL),
+		models:    append([]ModelSpec(nil), models...),
+	})
+}
+
+// ---- Quota fetching ---------------------------------------------------------
+
+// FetchQuota fetches upstream Kiro usage/quota info by probing the
+// getUsageLimits endpoints. It tries three endpoints in sequence and returns
+// provider-specific error messages based on the auth method.
+
+func (c *Kiro) FetchQuota(ctx context.Context, creds core.Credentials) (*QuotaResult, error) {
+	// API-key accounts carry the credential in APIKey; OAuth/social accounts in
+	// AccessToken. Resolve whichever is present so the quota probe works for
+	// every auth method.
+	token := kiroAPIKey(creds)
+	if token == "" {
+		return &QuotaResult{Message: "No credential; cannot fetch quota."}, nil
+	}
+	if cached, ok := loadKiroQuota(creds.AccountID); ok {
+		return cached, nil
+	}
+	releaseAccount, err := c.acquireAccountSlot(ctx, creds, "quota")
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAccount()
+	if cached, ok := loadKiroQuota(creds.AccountID); ok {
+		return cached, nil
+	}
+	region := creds.Extra["kiro_region"]
+	if region == "" {
+		region = "us-east-1"
+	}
+	authMethod := creds.Extra["kiro_auth_method"]
+	isAPIKey := authMethod == "api_key"
+
+	profileArn := kiroResolveProfileArn(creds)
+	// Account-bound auth only sends a profileArn resolved for the credential.
+	// OAuth/social connections may use their shared profile fallback.
+
+	authHeaders := map[string]string{
+		"Authorization":    bearer(token),
+		"Accept":           "application/json",
+		"User-Agent":       "aws-sdk-js/1.0.0 KiroIDE",
+		"x-amz-user-agent": "aws-sdk-js/1.0.0 KiroIDE",
+	}
+	// Headless API keys must be marked so CodeWhisperer treats them as a
+	// long-lived API key rather than an OIDC token; without it the quota call
+	// is rejected (401/403).
+	if isAPIKey {
+		authHeaders["tokentype"] = "API_KEY"
+	} else if isKiroExternalIDP(creds) {
+		authHeaders["TokenType"] = "EXTERNAL_IDP"
+	}
+
+	sawAuthError := false
+
+	// Attempt 1: GET on codewhisperer endpoint.
+	params := "isEmailRequired=true&origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
+	url1 := fmt.Sprintf("https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits?%s", params)
+	body, err := doJSONMethod(ctx, http.MethodGet, c.id, "quota", url1, nil, authHeaders)
+	if err == nil {
+		return c.cacheKiroQuota(creds.AccountID, body)
+	}
+	if isAuthError(err) {
+		sawAuthError = true
+	}
+	if !kiroQuotaEndpointRetryable(err) {
+		return nil, err
+	}
+
+	// Attempt 2: POST on codewhisperer endpoint. Only include profileArn when
+	// one is set (api-key connections without a resolved profile omit it).
+	postBody := map[string]string{"origin": "AI_EDITOR", "resourceType": "AGENTIC_REQUEST"}
+	if profileArn != "" {
+		postBody["profileArn"] = profileArn
+	}
+	postJSON, _ := json.Marshal(postBody)
+	postHeaders := map[string]string{
+		"Authorization": bearer(token),
+		"Content-Type":  "application/x-amz-json-1.0",
+		"x-amz-target":  "AmazonCodeWhispererService.GetUsageLimits",
+		"Accept":        "application/json",
+	}
+	if isAPIKey {
+		postHeaders["tokentype"] = "API_KEY"
+	} else if isKiroExternalIDP(creds) {
+		postHeaders["TokenType"] = "EXTERNAL_IDP"
+	}
+	body, err = doJSON(ctx, c.id, "quota", "https://codewhisperer.us-east-1.amazonaws.com", postJSON, postHeaders)
+	if err == nil {
+		return c.cacheKiroQuota(creds.AccountID, body)
+	}
+	if isAuthError(err) {
+		sawAuthError = true
+	}
+	if !kiroQuotaEndpointRetryable(err) {
+		return nil, err
+	}
+
+	// Attempt 3: GET on q endpoint, including profileArn only when set.
+	qParams := "origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
+	if profileArn != "" {
+		qParams = fmt.Sprintf("origin=AI_EDITOR&profileArn=%s&resourceType=AGENTIC_REQUEST", profileArn)
+	}
+	url3 := fmt.Sprintf("https://q.%s.amazonaws.com/getUsageLimits?%s", region, qParams)
+	body, err = doJSONMethod(ctx, http.MethodGet, c.id, "quota", url3, nil, authHeaders)
+	if err == nil {
+		return c.cacheKiroQuota(creds.AccountID, body)
+	}
+	if isAuthError(err) {
+		sawAuthError = true
+	}
+
+	// Return provider-specific messages keyed on the auth method.
+	if sawAuthError {
+
+		switch authMethod {
+		case "idc":
+			return &QuotaResult{Message: "Kiro quota API is unavailable for the current AWS IAM Identity Center session. Chat may still work. If this persists after renewing your session, reconnect Kiro."}, nil
+		case "google", "github":
+			return &QuotaResult{Message: "Kiro quota API authentication expired. Chat may still work."}, nil
+		default:
+			return &QuotaResult{Message: "Kiro quota API rejected the current token. Chat may still work."}, nil
+		}
+	}
+	return &QuotaResult{Message: "Unable to fetch Kiro usage right now."}, nil
+}
+
+func kiroQuotaEndpointRetryable(err error) bool {
+	pe := core.AsProviderError(err)
+	switch pe.Kind {
+	case core.ErrAuth, core.ErrBadRequest, core.ErrUpstream, core.ErrTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func loadKiroQuota(accountID string) (*QuotaResult, bool) {
+	if accountID == "" {
+		return nil, false
+	}
+	value, ok := kiroQuotaCache.Load(accountID)
+	if !ok {
+		return nil, false
+	}
+	entry := value.(kiroQuotaCacheEntry)
+	if time.Now().After(entry.expiresAt) {
+		kiroQuotaCache.Delete(accountID)
+		return nil, false
+	}
+	return cloneKiroQuota(entry.quota), true
+}
+
+func (c *Kiro) cacheKiroQuota(accountID string, body []byte) (*QuotaResult, error) {
+	quota, err := parseKiroQuota(body)
+	if err != nil || accountID == "" {
+		return quota, err
+	}
+	kiroQuotaCache.Store(accountID, kiroQuotaCacheEntry{
+		expiresAt: time.Now().Add(kiroQuotaCacheTTL),
+		quota:     cloneKiroQuota(quota),
+	})
+	return quota, nil
+}
+
+func cloneKiroQuota(quota *QuotaResult) *QuotaResult {
+	if quota == nil {
+		return nil
+	}
+	copy := *quota
+	copy.Quotas = append([]QuotaEntry(nil), quota.Quotas...)
+	return &copy
+}
+
+// isAuthError checks if a provider error is an auth failure (401/403).
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	pe := core.AsProviderError(err)
+	return pe.Kind == core.ErrAuth
+}
+
+// kiroQuotaBreakdown mirrors the JSON shape of one usageBreakdownList entry.
+// The precision fields can be either a bare number or an object {value, precision}.
+type kiroQuotaBreakdown struct {
+	ResourceType              string          `json:"resourceType"`
+	CurrentUsageWithPrecision json.RawMessage `json:"currentUsageWithPrecision"`
+	UsageLimitWithPrecision   json.RawMessage `json:"usageLimitWithPrecision"`
+	FreeTrialInfo             *struct {
+		CurrentUsageWithPrecision json.RawMessage `json:"currentUsageWithPrecision"`
+		UsageLimitWithPrecision   json.RawMessage `json:"usageLimitWithPrecision"`
+		FreeTrialExpiry           string          `json:"freeTrialExpiry"`
+	} `json:"freeTrialInfo"`
+}
+
+// parseKiroDateField extracts a date string from a field that may be a bare
+// string or a Unix timestamp number.
+func parseKiroDateField(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	// Try string first.
+	var s string
+	if json.Unmarshal(raw, &s) == nil && s != "" {
+		return s
+	}
+	// Try number (Unix timestamp).
+	var n int64
+	if json.Unmarshal(raw, &n) == nil && n > 0 {
+		return fmt.Sprintf("%d", n)
+	}
+	// Try float.
+	var f float64
+	if json.Unmarshal(raw, &f) == nil && f > 0 {
+		return fmt.Sprintf("%d", int64(f))
+	}
+	return ""
+}
+
+// parseKiroPrecision extracts an int from a field that may be a bare number
+// (int or float) or an object {"value": N, "precision": "EXACT"}.
+func parseKiroPrecision(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	// Try bare number first (int or float).
+	var f float64
+	if json.Unmarshal(raw, &f) == nil {
+		return int(f)
+	}
+	// Try object form.
+	var obj struct {
+		Value float64 `json:"value"`
+	}
+	if json.Unmarshal(raw, &obj) == nil {
+		return int(obj.Value)
+	}
+	return 0
+}
+
+// parseKiroQuota parses the getUsageLimits response into a QuotaResult.
+func parseKiroQuota(body []byte) (*QuotaResult, error) {
+
+	var data struct {
+		UsageBreakdownList []kiroQuotaBreakdown `json:"usageBreakdownList"`
+		SubscriptionInfo   struct {
+			SubscriptionTitle string `json:"subscriptionTitle"`
+		} `json:"subscriptionInfo"`
+		NextDateReset json.RawMessage `json:"nextDateReset"`
+		ResetDate     json.RawMessage `json:"resetDate"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, fmt.Errorf("parse quota: %w", err)
+	}
+
+	resetAt := parseKiroDateField(data.NextDateReset)
+	if resetAt == "" {
+		resetAt = parseKiroDateField(data.ResetDate)
+	}
+
+	planName := data.SubscriptionInfo.SubscriptionTitle
+	if planName == "" {
+		planName = "Kiro"
+	}
+
+	result := &QuotaResult{PlanName: planName}
+
+	for _, bd := range data.UsageBreakdownList {
+		used := parseKiroPrecision(bd.CurrentUsageWithPrecision)
+		limit := parseKiroPrecision(bd.UsageLimitWithPrecision)
+		remaining := limit - used
+		if remaining < 0 {
+			remaining = 0
+		}
+
+		resourceType := strings.ToLower(bd.ResourceType)
+		if resourceType == "" {
+			resourceType = "unknown"
+		}
+
+		result.Quotas = append(result.Quotas, QuotaEntry{
+			ResourceType: resourceType,
+			Used:         used,
+			Limit:        limit,
+			Remaining:    remaining,
+			ResetAt:      resetAt,
+			PlanName:     planName,
+		})
+
+		// Free trial quota (if available).
+		if bd.FreeTrialInfo != nil {
+			freeUsed := parseKiroPrecision(bd.FreeTrialInfo.CurrentUsageWithPrecision)
+			freeLimit := parseKiroPrecision(bd.FreeTrialInfo.UsageLimitWithPrecision)
+			freeRemaining := freeLimit - freeUsed
+			if freeRemaining < 0 {
+				freeRemaining = 0
+			}
+			freeReset := bd.FreeTrialInfo.FreeTrialExpiry
+			if freeReset == "" {
+				freeReset = resetAt
+			}
+			result.Quotas = append(result.Quotas, QuotaEntry{
+				ResourceType: resourceType + "_freetrial",
+				Used:         freeUsed,
+				Limit:        freeLimit,
+				Remaining:    freeRemaining,
+				ResetAt:      freeReset,
+				PlanName:     planName,
+			})
+		}
+	}
+	return result, nil
+}
+
+func init() {
+	k := &Kiro{id: "kiro"}
+	RegisterLiveModelSource("kiro", k)
+	RegisterQuotaSource("kiro", k)
+}
+
+// Chat performs a non-streaming call by draining the event stream and folding
+// the chunks into a single response.
+func (c *Kiro) Chat(ctx context.Context, req *core.ChatRequest, creds core.Credentials) (*core.ChatResponse, error) {
+	stream, err := c.Stream(ctx, req, creds, core.StreamConfig{})
+	if err != nil {
+		return nil, err
+	}
+
+	msg := core.Message{Role: core.RoleAssistant}
+	var text, thinking string
+	toolCalls := map[string]*core.ToolCall{}
+	var toolOrder []string
+	finish := core.FinishStop
+	var usage core.Usage
+	var streamErr *core.ProviderError
+
+	for ch := range stream {
+		switch ch.Type {
+		case core.ChunkText:
+			text += ch.Delta
+		case core.ChunkThinking:
+			thinking += ch.Delta
+		case core.ChunkToolCall:
+			if ch.ToolCall != nil {
+				existing, ok := toolCalls[ch.ToolCall.ID]
+				if !ok {
+					tc := *ch.ToolCall
+					toolCalls[ch.ToolCall.ID] = &tc
+					toolOrder = append(toolOrder, ch.ToolCall.ID)
+				} else if len(ch.ToolCall.Arguments) > 0 {
+					existing.Arguments = append(existing.Arguments, ch.ToolCall.Arguments...)
+				}
+				finish = core.FinishToolCalls
+			}
+		case core.ChunkFinish:
+			if ch.FinishReason != "" {
+				finish = ch.FinishReason
+			}
+		case core.ChunkUsage:
+			if ch.Usage != nil {
+				usage = *ch.Usage
+			}
+		case core.ChunkError:
+			if ch.Err != nil && streamErr == nil {
+				streamErr = core.AsProviderError(ch.Err)
+			}
+		}
+	}
+
+	if thinking != "" {
+		msg.Content = append(msg.Content, core.ContentPart{Type: core.PartThinking, Text: thinking})
+	}
+	if text != "" {
+		msg.Content = append(msg.Content, core.ContentPart{Type: core.PartText, Text: text})
+	}
+	for _, id := range toolOrder {
+		tc := toolCalls[id]
+		if len(tc.Arguments) == 0 {
+			tc.Arguments = json.RawMessage("{}")
+		}
+		msg.Content = append(msg.Content, core.ContentPart{Type: core.PartToolCall, ToolCall: tc})
+	}
+
+	if streamErr != nil {
+		if usage.PromptTokens != 0 || usage.CompletionTokens != 0 || usage.TotalTokens != 0 {
+			attemptUsage := usage
+			streamErr.AttemptUsage = &attemptUsage
+		}
+		return nil, streamErr
+	}
+
+	if kind := kiroIntegrityKind(text, len(toolOrder) > 0); kind != "" {
+		attemptUsage := usage
+		return nil, &core.ProviderError{
+			Kind:                   core.ErrUpstream,
+			Scope:                  core.FailureScopeRequest,
+			Provider:               c.id,
+			Model:                  req.Model,
+			Message:                "kiro response integrity check failed: " + kind,
+			RetrySystemInstruction: kiroRepairInstructions[kind],
+			AttemptUsage:           &attemptUsage,
+		}
+	}
+
+	return &core.ChatResponse{Model: req.Model, Message: msg, FinishReason: finish, Usage: usage}, nil
+}
+
+// pipeKiroResponse reads an HTTP eventstream response into a buffered channel,
+// converting frames to canonical chunks and closing the body at EOF.
+func (c *Kiro) pipeKiroResponse(ctx context.Context, resp *http.Response, req *core.ChatRequest, ttft *ttftTracker) <-chan core.StreamChunk {
+	ch := make(chan core.StreamChunk, 64)
+	go func() {
+		defer close(ch)
+		defer resp.Body.Close()
+		parser := newEventStreamParser(resp.Body)
+		seenTools := map[string]bool{}
+		hasTool := false
+		usageSeen := false
+		outputChars := 0
+		terminalSeen := false
+		pendingBytes := 0
+		pending := make([]core.StreamChunk, 0, 64)
+
+		emitError := func(err error) {
+			select {
+			case ch <- core.StreamChunk{Type: core.ChunkError, Err: err}:
+			case <-ctx.Done():
+			}
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			frame, ferr := parser.next()
+			if ferr != nil {
+				if ferr != errEventStreamEOF {
+					emitError(&core.ProviderError{Kind: core.ErrUpstream, Scope: core.FailureScopeRequest, Provider: c.id, Model: req.Model, Message: ferr.Error(), Cause: ferr})
+					return
+				}
+				break
+			}
+			if frame == nil {
+				continue
+			}
+			if frame.headers[":event-type"] == "messageStopEvent" {
+				terminalSeen = true
+			}
+			for _, chunk := range kiroFrameToChunks(frame, seenTools, &hasTool) {
+				if chunk.Type == core.ChunkError && chunk.Err != nil {
+					pe := core.AsProviderError(chunk.Err)
+					copy := *pe
+					copy.Provider = c.id
+					copy.Model = req.Model
+					chunk.Err = &copy
+					emitError(chunk.Err)
+					return
+				}
+				if chunk.Type == core.ChunkUsage {
+					usageSeen = true
+				}
+				if chunk.Type == core.ChunkText || chunk.Type == core.ChunkThinking {
+					outputChars += len(chunk.Delta)
+				}
+				pendingBytes += kiroChunkSize(chunk)
+				if pendingBytes > kiroIntegrityBufferMaxBytes {
+					emitError(&core.ProviderError{
+						Kind: core.ErrUpstream, Scope: core.FailureScopeRequest, Provider: c.id, Model: req.Model,
+						Message: "kiro response integrity buffer exceeded before terminal event",
+					})
+					return
+				}
+				pending = append(pending, chunk)
+			}
+		}
+		if !terminalSeen {
+			emitError(&core.ProviderError{
+				Kind: core.ErrUpstream, Scope: core.FailureScopeRequest, Provider: c.id, Model: req.Model,
+				Message: "kiro stream ended without messageStopEvent",
+			})
+			return
+		}
+		if !usageSeen {
+			if u := estimateKiroUsage(req, outputChars); u != nil {
+				pending = append(pending, core.StreamChunk{Type: core.ChunkUsage, Usage: u})
+			}
+		}
+		for _, chunk := range pending {
+			if ttft != nil {
+				ttft.maybeReport(chunk)
+			}
+			select {
+			case ch <- chunk:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+func kiroChunkSize(chunk core.StreamChunk) int {
+	size := len(chunk.Delta) + len(chunk.Signature) + 32
+	if chunk.ToolCall != nil {
+		size += len(chunk.ToolCall.ID) + len(chunk.ToolCall.Name) + len(chunk.ToolCall.Arguments)
+	}
+	return size
+}
+
+// Stream performs a streaming call and parses the AWS EventStream into
+// canonical chunks. Kiro output is held in a bounded integrity buffer until a
+// valid terminal event is observed, preventing partial turns from being
+// exposed as successful responses.
+func (c *Kiro) Stream(ctx context.Context, req *core.ChatRequest, creds core.Credentials, cfg core.StreamConfig) (<-chan core.StreamChunk, error) {
+	releaseAccount, err := c.acquireAccountSlot(ctx, creds, req.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	profileArn := kiroResolveProfileArn(creds)
+	body, err := c.codec.RenderRequestForAccount(req, profileArn, creds.AccountID)
+	if err != nil {
+		releaseAccount()
+		return nil, &core.ProviderError{Kind: core.ErrInternal, Provider: c.id, Model: req.Model, Message: err.Error(), Cause: err}
+	}
+
+	resp, err := c.openStreamWithFailover(ctx, req.Model, body, c.headers(creds), c.endpoints(creds))
+	if err != nil {
+		releaseAccount()
+		return nil, err
+	}
+
+	out := make(chan core.StreamChunk, 16)
+	go func() {
+		defer close(out)
+		defer releaseAccount()
+
+		ttft := newTTFTTracker(cfg)
+		for ch := range c.pipeKiroResponse(ctx, resp, req, ttft) {
+			select {
+			case out <- ch:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
+}
+
+// kiroIntegrityKind inspects accumulated stream output and returns the repair
+// kind needed ("ellipsis" or "short_final"), or "" when the response is
+// acceptable. Tool payload integrity is validated while parsing its event.
+func kiroIntegrityKind(content string, hasTool bool) string {
+	text := strings.TrimSpace(strings.ReplaceAll(content, "\u2019", "'"))
+	if text == "..." || text == "\u2026" {
+		return "ellipsis"
+	}
+	if hasTool || len([]rune(text)) > kiroShortFinalMaxChars {
+		return ""
+	}
+	if reCompletedFinal.MatchString(text) || reResultEvidence.MatchString(text) || reUserWait.MatchString(text) {
+		return ""
+	}
+	isEN := reShortFutureActionEN.MatchString(text)
+	isZH := reShortFutureActionZH.MatchString(text)
+	if isEN && reResultClauseEN.MatchString(text) {
+		return ""
+	}
+	if isZH && reResultClauseZH.MatchString(text) {
+		return ""
+	}
+	if isEN || isZH {
+		return "short_final"
+	}
+	return ""
+}
+
+// estimateKiroUsage produces a best-effort token estimate for a Kiro response
+// when the upstream omits token accounting. It approximates ~4 characters per
+// token over the rendered request input and the streamed output. The result is marked
+// Estimated so downstream consumers can distinguish it from exact counts.
+func estimateKiroUsage(req *core.ChatRequest, outputChars int) *core.Usage {
+	inputChars := 0
+	if req != nil {
+		if req.System != "" {
+			inputChars += len(req.System)
+		}
+		for _, m := range req.Messages {
+			for _, part := range m.Content {
+				inputChars += len(part.Text)
+				if part.ToolCall != nil {
+					inputChars += len(part.ToolCall.Arguments)
+				}
+				if part.ToolResult != nil {
+					inputChars += len(part.ToolResult.Content)
+				}
+			}
+		}
+	}
+	prompt := charsToTokens(inputChars)
+	completion := charsToTokens(outputChars)
+	if prompt == 0 && completion == 0 {
+		return nil
+	}
+	return &core.Usage{
+		PromptTokens:     prompt,
+		CompletionTokens: completion,
+		TotalTokens:      prompt + completion,
+		Source:           core.UsageSourceEstimated,
+	}
+}
+
+// charsToTokens converts a character count to an approximate token count using
+// the common ~4 chars/token rule, rounding up so any non-empty text counts as
+// at least one token.
+func charsToTokens(chars int) int {
+	if chars <= 0 {
+		return 0
+	}
+	return (chars + 3) / 4
+}
+
+// kiroFrameToChunks maps one decoded Kiro eventstream frame to canonical chunks.
+func kiroFrameToChunks(frame *eventStreamFrame, seenTools map[string]bool, hasTool *bool) []core.StreamChunk {
+	eventType := frame.headers[":event-type"]
+	var chunks []core.StreamChunk
+	messageType := strings.ToLower(frame.headers[":message-type"])
+	if messageType == "error" || messageType == "exception" {
+		return []core.StreamChunk{{
+			Type: core.ChunkError,
+			Err: &core.ProviderError{
+				Kind: core.ErrUpstream, Scope: core.FailureScopeRequest,
+				Message: kiroErrorFrameMessage(frame),
+			},
+		}}
+	}
+
+	switch eventType {
+	case "assistantResponseEvent", "codeEvent":
+		var p struct {
+			Content string `json:"content"`
+		}
+		if json.Unmarshal(frame.payload, &p) == nil && p.Content != "" {
+			chunks = append(chunks, core.StreamChunk{Type: core.ChunkText, Delta: p.Content})
+		}
+
+	case "reasoningContentEvent":
+		text := extractKiroReasoning(frame.payload)
+		if text != "" {
+			chunks = append(chunks, core.StreamChunk{Type: core.ChunkThinking, Delta: text})
+		}
+
+	case "toolUseEvent":
+		toolChunks, err := kiroToolUseChunks(frame.payload, seenTools)
+		if err != nil {
+			chunks = append(chunks, core.StreamChunk{
+				Type: core.ChunkError,
+				Err: &core.ProviderError{
+					Kind:                   core.ErrUpstream,
+					Scope:                  core.FailureScopeRequest,
+					Message:                "kiro response integrity check failed: malformed tool call: " + err.Error(),
+					RetrySystemInstruction: kiroRepairInstructions["tool"],
+				},
+			})
+			break
+		}
+		chunks = append(chunks, toolChunks...)
+		if len(toolChunks) > 0 {
+			*hasTool = true
+		}
+
+	case "messageStopEvent":
+		reason := core.FinishStop
+		if *hasTool {
+			reason = core.FinishToolCalls
+		}
+		chunks = append(chunks, core.StreamChunk{Type: core.ChunkFinish, FinishReason: reason})
+
+	case "metricsEvent", "usageEvent":
+		// Kiro emits token accounting under two event names depending on the
+		// model and region: "metricsEvent" (CodeWhisperer) and "usageEvent"
+		// (newer social/token-plan backends). Both carry inputTokens/
+		// outputTokens, optionally nested under a key matching the event name.
+		if u := parseKiroUsage(eventType, frame.payload); u != nil {
+			chunks = append(chunks, core.StreamChunk{Type: core.ChunkUsage, Usage: u})
+		}
+	}
+	return chunks
+}
+
+func kiroErrorFrameMessage(frame *eventStreamFrame) string {
+	var payload struct {
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	_ = json.Unmarshal(frame.payload, &payload)
+	message := payload.Message
+	if message == "" {
+		message = payload.Error
+	}
+	if message == "" {
+		message = strings.TrimSpace(string(frame.payload))
+	}
+	if message == "" {
+		message = "kiro eventstream error"
+	}
+	if exceptionType := frame.headers[":exception-type"]; exceptionType != "" {
+		message = exceptionType + ": " + message
+	}
+	return message
+}
+
+// parseKiroUsage extracts token usage from a metricsEvent/usageEvent payload.
+// The counts may sit at the top level or be nested under a key matching the
+// event type. Returns nil when no usable counts are present.
+func parseKiroUsage(eventType string, payload []byte) *core.Usage {
+	var p struct {
+		InputTokens  int `json:"inputTokens"`
+		OutputTokens int `json:"outputTokens"`
+	}
+	raw := payload
+	var wrap map[string]json.RawMessage
+	if json.Unmarshal(payload, &wrap) == nil {
+		if m, ok := wrap[eventType]; ok {
+			raw = m
+		}
+	}
+	if json.Unmarshal(raw, &p) != nil {
+		return nil
+	}
+	if p.InputTokens <= 0 && p.OutputTokens <= 0 {
+		return nil
+	}
+	return &core.Usage{
+		PromptTokens:     p.InputTokens,
+		CompletionTokens: p.OutputTokens,
+		TotalTokens:      p.InputTokens + p.OutputTokens,
+		Source:           core.UsageSourceProvider,
+	}
+}
+
+func extractKiroReasoning(payload []byte) string {
+	// Payload may be a string, {text|content}, or {reasoningContentEvent:{...}}.
+	var asString string
+	if json.Unmarshal(payload, &asString) == nil && asString != "" {
+		return asString
+	}
+	var obj struct {
+		Text                  string `json:"text"`
+		Content               string `json:"content"`
+		ReasoningContentEvent struct {
+			Text    string `json:"text"`
+			Content string `json:"content"`
+		} `json:"reasoningContentEvent"`
+	}
+	if json.Unmarshal(payload, &obj) != nil {
+		return ""
+	}
+	if obj.Text != "" {
+		return obj.Text
+	}
+	if obj.Content != "" {
+		return obj.Content
+	}
+	if obj.ReasoningContentEvent.Text != "" {
+		return obj.ReasoningContentEvent.Text
+	}
+	return obj.ReasoningContentEvent.Content
+}
+
+func kiroToolUseChunks(payload []byte, seenTools map[string]bool) ([]core.StreamChunk, error) {
+	workingSeen := make(map[string]bool, len(seenTools))
+	for id, seen := range seenTools {
+		workingSeen[id] = seen
+	}
+
+	parseOne := func(raw json.RawMessage) ([]core.StreamChunk, error) {
+		var t struct {
+			ToolUseID string          `json:"toolUseId"`
+			Name      string          `json:"name"`
+			Input     json.RawMessage `json:"input"`
+		}
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return nil, fmt.Errorf("invalid payload: %w", err)
+		}
+		t.Name = strings.TrimSpace(t.Name)
+		if t.Name == "" {
+			return nil, fmt.Errorf("tool name is empty")
+		}
+		if len(t.Input) == 0 || strings.TrimSpace(string(t.Input)) == "null" {
+			return nil, fmt.Errorf("tool arguments are missing")
+		}
+
+		args := t.Input
+		var asStr string
+		if json.Unmarshal(t.Input, &asStr) == nil {
+			asStr = strings.TrimSpace(asStr)
+			if asStr == "" || !json.Valid([]byte(asStr)) {
+				return nil, fmt.Errorf("tool arguments are not valid JSON")
+			}
+			args = json.RawMessage(asStr)
+		} else if !json.Valid(t.Input) {
+			return nil, fmt.Errorf("tool arguments are not valid JSON")
+		}
+
+		id := t.ToolUseID
+		if id == "" {
+			id = "call_" + uuid.NewString()
+		}
+		var chunks []core.StreamChunk
+		if !workingSeen[id] {
+			workingSeen[id] = true
+			chunks = append(chunks, core.StreamChunk{
+				Type:     core.ChunkToolCall,
+				ToolCall: &core.ToolCall{ID: id, Name: t.Name, Arguments: json.RawMessage("")},
+			})
+		}
+		chunks = append(chunks, core.StreamChunk{
+			Type:     core.ChunkToolCall,
+			ToolCall: &core.ToolCall{ID: id, Arguments: args},
+		})
+		return chunks, nil
+	}
+
+	commitSeen := func() {
+		for id, seen := range workingSeen {
+			seenTools[id] = seen
+		}
+	}
+
+	trimmed := []byte(strings.TrimSpace(string(payload)))
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var arr []json.RawMessage
+		if err := json.Unmarshal(payload, &arr); err != nil {
+			return nil, fmt.Errorf("invalid tool list: %w", err)
+		}
+		if len(arr) == 0 {
+			return nil, fmt.Errorf("tool list is empty")
+		}
+		var chunks []core.StreamChunk
+		for _, item := range arr {
+			itemChunks, err := parseOne(item)
+			if err != nil {
+				return nil, err
+			}
+			chunks = append(chunks, itemChunks...)
+		}
+		commitSeen()
+		return chunks, nil
+	}
+	chunks, err := parseOne(payload)
+	if err == nil {
+		commitSeen()
+	}
+	return chunks, err
+}
+
+// ---- AWS EventStream binary parser ------------------------------------------
+
+// errEventStreamEOF signals the stream ended cleanly.
+var errEventStreamEOF = errEventStreamDone{}
+
+type errEventStreamDone struct{}
+
+func (errEventStreamDone) Error() string { return "eventstream: EOF" }
+
+// eventStreamFrame is one decoded AWS EventStream message: its string headers
+// plus the raw JSON payload.
+type eventStreamFrame struct {
+	headers map[string]string
+	payload []byte
+}
+
+// eventStreamParser reads AWS EventStream binary frames from an io.Reader. Each
+// frame is: [4-byte total length][4-byte headers length][4-byte prelude CRC]
+// [headers][payload][4-byte message CRC], all big-endian. Headers are
+// length-prefixed name/value pairs; only string headers (type 7) are decoded,
+// which is all CodeWhisperer emits (:event-type, :content-type, :message-type).
+type eventStreamParser struct {
+	r   io.Reader
+	buf []byte
+}
+
+func newEventStreamParser(r io.Reader) *eventStreamParser {
+	return &eventStreamParser{r: r}
+}
+
+// next returns the next decoded frame, errEventStreamEOF at end of stream, or a
+// transport error. It returns (nil, nil) for a frame that decoded to no usable
+// content so the caller can continue.
+func (p *eventStreamParser) next() (*eventStreamFrame, error) {
+	// Ensure at least the 12-byte prelude is buffered.
+	for len(p.buf) < 12 {
+		if err := p.fill(); err != nil {
+			if err == io.EOF && len(p.buf) == 0 {
+				return nil, errEventStreamEOF
+			}
+			if err == io.EOF {
+				return nil, fmt.Errorf("eventstream: truncated prelude: %w", io.ErrUnexpectedEOF)
+			}
+			return nil, err
+		}
+	}
+
+	totalLen := int(binary.BigEndian.Uint32(p.buf[0:4]))
+	if totalLen < 16 {
+		return nil, fmt.Errorf("eventstream: invalid frame length %d", totalLen)
+	}
+	if totalLen > eventStreamMaxMessageBytes {
+		return nil, fmt.Errorf("eventstream: frame length %d exceeds limit %d", totalLen, eventStreamMaxMessageBytes)
+	}
+	headersLen := int(binary.BigEndian.Uint32(p.buf[4:8]))
+	if headersLen > eventStreamMaxHeadersBytes {
+		return nil, fmt.Errorf("eventstream: headers length %d exceeds limit %d", headersLen, eventStreamMaxHeadersBytes)
+	}
+	if 12+headersLen+4 > totalLen {
+		return nil, fmt.Errorf("eventstream: headers length %d exceeds frame payload", headersLen)
+	}
+
+	// Buffer the whole frame.
+	for len(p.buf) < totalLen {
+		if err := p.fill(); err != nil {
+			if err == io.EOF {
+				return nil, fmt.Errorf("eventstream: truncated frame: %w", io.ErrUnexpectedEOF)
+			}
+			return nil, err
+		}
+	}
+
+	frame := p.buf[:totalLen]
+	p.buf = p.buf[totalLen:]
+
+	return decodeEventStreamFrame(frame)
+}
+
+// fill reads more bytes into the buffer.
+func (p *eventStreamParser) fill() error {
+	tmp := make([]byte, 32*1024)
+	n, err := p.r.Read(tmp)
+	if n > 0 {
+		p.buf = append(p.buf, tmp[:n]...)
+		return nil
+	}
+	return err
+}
+
+// decodeEventStreamFrame parses one complete frame's bytes.
+func decodeEventStreamFrame(frame []byte) (*eventStreamFrame, error) {
+	if len(frame) < 16 {
+		return nil, fmt.Errorf("eventstream: short frame")
+	}
+	if declared := int(binary.BigEndian.Uint32(frame[0:4])); declared != len(frame) {
+		return nil, fmt.Errorf("eventstream: declared frame length %d does not match %d bytes", declared, len(frame))
+	}
+	headersLen := int(binary.BigEndian.Uint32(frame[4:8]))
+	if len(frame) > eventStreamMaxMessageBytes {
+		return nil, fmt.Errorf("eventstream: frame exceeds maximum size")
+	}
+	if headersLen > eventStreamMaxHeadersBytes || 12+headersLen+4 > len(frame) {
+		return nil, fmt.Errorf("eventstream: invalid headers length %d", headersLen)
+	}
+	if want, got := binary.BigEndian.Uint32(frame[8:12]), crc32.ChecksumIEEE(frame[:8]); want != got {
+		return nil, fmt.Errorf("eventstream: prelude CRC mismatch")
+	}
+	if want, got := binary.BigEndian.Uint32(frame[len(frame)-4:]), crc32.ChecksumIEEE(frame[:len(frame)-4]); want != got {
+		return nil, fmt.Errorf("eventstream: message CRC mismatch")
+	}
+
+	headers := map[string]string{}
+	offset := 12 // after prelude (8) + prelude CRC (4)
+	headerEnd := 12 + headersLen
+	if headerEnd > len(frame) {
+		return nil, fmt.Errorf("eventstream: headers exceed frame")
+	}
+
+	for offset < headerEnd {
+		nameLen := int(frame[offset])
+		offset++
+		if nameLen == 0 || offset+nameLen > headerEnd {
+			return nil, fmt.Errorf("eventstream: malformed header name")
+		}
+		name := string(frame[offset : offset+nameLen])
+		offset += nameLen
+		if offset >= headerEnd {
+			return nil, fmt.Errorf("eventstream: missing header type")
+		}
+		headerType := frame[offset]
+		offset++
+		if headerType == 7 { // string
+			if offset+2 > headerEnd {
+				return nil, fmt.Errorf("eventstream: truncated header value length")
+			}
+			valueLen := int(binary.BigEndian.Uint16(frame[offset : offset+2]))
+			offset += 2
+			if offset+valueLen > headerEnd {
+				return nil, fmt.Errorf("eventstream: truncated header value")
+			}
+			headers[name] = string(frame[offset : offset+valueLen])
+			offset += valueLen
+		} else {
+			return nil, fmt.Errorf("eventstream: unsupported header type %d", headerType)
+		}
+	}
+
+	payloadStart := 12 + headersLen
+	payloadEnd := len(frame) - 4 // exclude message CRC
+	if payloadEnd < payloadStart {
+		return &eventStreamFrame{headers: headers, payload: nil}, nil
+	}
+	payload := frame[payloadStart:payloadEnd]
+	return &eventStreamFrame{headers: headers, payload: payload}, nil
+}

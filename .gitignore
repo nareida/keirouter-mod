@@ -1,0 +1,63 @@
+# Reference material (not part of KeiRouter source)
+_research/
+docs/
+
+# Go
+backend/bin/
+backend/dist/
+*.test
+*.out
+coverage.txt
+/keirouter
+/keirouter.exe
+/keirouter-test
+/backend/keirouter
+/backend/keirouter-test
+
+# Go build cache / vendor
+vendor/
+
+# Embedded frontend build output (generated)
+backend/internal/webui/dist/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+*.tsbuildinfo
+*.local
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+master.key
+
+# Data / runtime
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+data/
+.keirouter/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+.kiro/*
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
