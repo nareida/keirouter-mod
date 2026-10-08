@@ -233,7 +233,19 @@ func (r *CustomProviderRepo) UpdateModel(ctx context.Context, m CustomModel) err
 	return nil
 }
 
-// GetModel returns one custom model by id.
+// GetModelByProviderAndID finds a custom model by provider_id and model_id.
+func (r *CustomProviderRepo) GetModelByProviderAndID(ctx context.Context, providerID, modelID string) (CustomModel, error) {
+	q := r.db.rebind(`SELECT ` + customModelColumns + ` FROM custom_models WHERE provider_id = ? AND model_id = ? LIMIT 1`)
+	m, err := scanCustomModel(r.db.sql.QueryRowContext(ctx, q, providerID, modelID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return CustomModel{}, ErrNotFound
+	}
+	if err != nil {
+		return CustomModel{}, fmt.Errorf("store: get custom model: %w", err)
+	}
+	return m, nil
+}
+
 func (r *CustomProviderRepo) GetModel(ctx context.Context, id string) (CustomModel, error) {
 	q := r.db.rebind(`SELECT ` + customModelColumns + ` FROM custom_models WHERE id = ?`)
 	m, err := scanCustomModel(r.db.sql.QueryRowContext(ctx, q, id))

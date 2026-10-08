@@ -75,20 +75,27 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 				steps, serr := s.chains.ListSteps(r.Context(), c.ID)
 				if serr == nil {
 					for _, st := range steps {
-						spec, _ := connectors.FindModel(st.Provider, st.Model)
-						caps, _ := capabilityPayloadFor(st.Provider, st.Model, core.ServiceLLM, spec.ContextWindow)
-						ctx := caps.ContextWindow
+						ctx := 0
+						if spec, ok := connectors.FindModel(st.Provider, st.Model); ok && spec.ContextWindow > 0 {
+							caps, _ := capabilityPayloadFor(st.Provider, st.Model, core.ServiceLLM, spec.ContextWindow)
+							ctx = caps.ContextWindow
+						}
+						// Check custom_models repo for dynamic/custom providers
+				if ctx == 0 && s.db != nil && s.db.CustomProviders() != nil {
+					if cm, cerr := s.db.CustomProviders().GetModelByProviderAndID(r.Context(), st.Provider, st.Model); cerr == nil && cm.ContextWindow > 0 {
+						ctx = cm.ContextWindow
+					}
+				}
 						if ctx > chainMaxCtx {
 							chainMaxCtx = ctx
 						}
 					}
 				}
 			}
-			caps := modelCapabilities{ContextWindow: chainMaxCtx}
 			if chainMaxCtx == 0 {
-				chainMaxCtx = 262144 // sensible fallback for combo models
-				caps.ContextWindow = chainMaxCtx
+				chainMaxCtx = 1048576 // 1M default for combo/chains
 			}
+			caps := modelCapabilities{ContextWindow: chainMaxCtx}
 			if keyRestricted && !visibleToKey(c.Name, allowedModels) {
 				continue
 			}
