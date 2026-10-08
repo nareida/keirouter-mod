@@ -4,21 +4,20 @@ set -euo pipefail
 APP_PORT="${SERVER_PORT:-${PORT:-8080}}"
 echo "==> KeiRouter on port $APP_PORT"
 
-# Determine repo root (script may live in repo root or backend/)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "$SCRIPT_DIR/backend/cmd/keirouter/main.go" ]; then
   REPO_ROOT="$SCRIPT_DIR"
 elif [ -f "$SCRIPT_DIR/../backend/cmd/keirouter/main.go" ]; then
   REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 else
-  echo "ERROR: cannot find backend/cmd/keirouter/main.go from $SCRIPT_DIR"
-  exit 1
+  REPO_ROOT="$SCRIPT_DIR"
 fi
 
 BIN="$REPO_ROOT/keirouter-patched"
 if [ ! -x "$BIN" ]; then
-  echo "==> Building keirouter..."
-  (cd "$REPO_ROOT/backend" && go build -o "$BIN" ./cmd/keirouter)
+  echo "==> Downloading prebuilt binary from GitHub Release..."
+  curl -sL "https://github.com/nareida/keirouter-mod/releases/download/v1.0.0/keirouter-patched" -o "$BIN"
+  chmod +x "$BIN"
 fi
 
 export KEIROUTER_SERVER__HOST="0.0.0.0"
