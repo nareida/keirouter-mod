@@ -15,9 +15,17 @@ fi
 
 BIN="$REPO_ROOT/keirouter-patched"
 if [ ! -x "$BIN" ]; then
-  echo "==> Downloading prebuilt binary from GitHub Release..."
+  echo "==> Downloading keirouter-patched from GitHub Release..."
   curl -sL "https://github.com/nareida/keirouter-mod/releases/download/v1.0.0/keirouter-patched" -o "$BIN"
   chmod +x "$BIN"
+fi
+
+FRONTEND_DIR="$REPO_ROOT/frontend/dist"
+if [ ! -d "$FRONTEND_DIR" ]; then
+  echo "==> Downloading frontend dist from GitHub Release..."
+  mkdir -p "$REPO_ROOT/frontend"
+  curl -sL "https://github.com/nareida/keirouter-mod/releases/download/v1.0.0/frontend-dist.tar.gz" -o /tmp/frontend-dist.tar.gz
+  tar -xzf /tmp/frontend-dist.tar.gz -C "$REPO_ROOT/frontend"
 fi
 
 export KEIROUTER_SERVER__HOST="0.0.0.0"
@@ -27,8 +35,8 @@ export KEIROUTER_HEALTH__ENABLED=false
 export KEIROUTER_HEALTH__PROBE_INTERVAL=0
 export KEIROUTER_PROVIDER_HEALTH__ENABLED=false
 
-if [ -d "$REPO_ROOT/frontend/dist" ]; then
-  export KEIROUTER_FRONTEND_DIR="$REPO_ROOT/frontend/dist"
+if [ -d "$FRONTEND_DIR" ]; then
+  export KEIROUTER_FRONTEND_DIR="$FRONTEND_DIR"
 fi
 
 echo "==> Running $BIN on 0.0.0.0:$APP_PORT"
